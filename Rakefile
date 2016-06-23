@@ -13,10 +13,28 @@ task default: :spec
 #
 # "rake update" updates the copied_from_chef files so we can grab bugfixes or new features
 #
-CHEF_FILES = %w(chef/constants chef/delayed_evaluator chef/property
-                chef/resource chef/resource/action_class chef/provider
-                chef/mixin/params_validate chef/mixin/properties)
-SPEC_FILES = %w(unit/mixin/properties_spec.rb
+CHEF_FILES = %w(
+                chef/constants
+                chef/delayed_evaluator
+                chef/dsl/core
+                chef/dsl/declare_resource
+                chef/dsl/platform_introspection
+                chef/dsl/recipe
+                chef/dsl/universal
+                chef/mixin/lazy_module_include
+                chef/mixin/notifying_block
+                chef/mixin/params_validate
+                chef/mixin/powershell_out
+                chef/mixin/properties
+                chef/property
+                chef/provider
+                chef/provider/noop
+                chef/resource
+                chef/resource/action_class
+                chef/resource_builder
+              )
+SPEC_FILES = %w(
+                unit/mixin/properties_spec.rb
                 unit/property_spec.rb
                 unit/property/state_spec.rb
                 unit/property/validation_spec.rb
@@ -33,6 +51,7 @@ KEEP_FUNCTIONS = {
     resource_name self.use_automatic_resource_name
 
     identity state state_for_resource_reporter property_is_set reset_property
+    resource_initializing resource_initializing= to_hash
     self.properties self.state_properties self.state_attr
     self.identity_properties self.identity_property self.identity_attrs
     self.property self.property_type
@@ -47,17 +66,21 @@ KEEP_FUNCTIONS = {
   'chef/provider' => %w(
     initialize
     converge_if_changed
+    compile_and_converge_action
+    action
     self.use_inline_resources
     self.include_resource_dsl
     self.include_resource_dsl_module
   ),
+  'chef/dsl/recipe' => %w(),
 }
 KEEP_INCLUDES = {
   'chef/resource' => %w(Chef::Mixin::ParamsValidate Chef::Mixin::Properties),
-  'chef/provider' => [],
+  'chef/provider' => %w(Chef::DSL::Core),
+  'chef/dsl/recipe' => %w(Chef::DSL::Core Chef::DSL::Recipe Chef::Mixin::LazyModuleInclude),
 }
 KEEP_CLASSES = {
-  'chef/provider' => %w(Chef::Provider)
+  'chef/provider' => %w(Chef::Provider Chef::Provider::InlineResources Chef::Provider::InlineResources::ClassMethods)
 }
 SKIP_LINES = {
   'chef/dsl/recipe' => [ /include Chef::Mixin::PowershellOut/ ]
@@ -67,12 +90,18 @@ PROCESS_LINES = {
 # See chef_compat/resource for def. of resource_name and provider
 # See chef_compat/monkeypatches/chef/resource for def. of current_value
 
+desc "Pull new files from the chef client this is bundled with and update this cookbook"
 task :update do
   # Copy files from chef to chef_compat/chef, with a few changes
   target_path = File.expand_path("../files/lib/chef_compat/copied_from_chef", __FILE__)
   chef_gem_path = Bundler.environment.specs['chef'].first.full_gem_path
   CHEF_FILES.each do |file|
     output = StringIO.new
+    # First lets try to load the original file if it exists
+    output.puts "begin"
+    output.puts "  require '#{file}'"
+    output.puts "rescue LoadError; end"
+    output.puts ""
     # Wrap the whole thing in a ChefCompat module
     output.puts "require 'chef_compat/copied_from_chef'"
     output.puts "class Chef"
@@ -150,11 +179,7 @@ task :update do
           line = "#{indent}#{type}#{space}#{class_name} < (defined?(#{original_class}) ? #{original_class} : #{superclass_name})"
         else
           # Modules have a harder time of it because of self methods
-          line += "#{indent}  if defined?(#{original_class})\n"
-          line += "#{indent}    require 'chef_compat/delegating_class'\n"
-          line += "#{indent}    extend DelegatingClass\n"
-          line += "#{indent}    @delegates_to = #{original_class}\n"
-          line += "#{indent}  end"
+          line += "#{indent}  CopiedFromChef.extend_chef_module(#{original_class}, self) if defined?(#{original_class})"
         end
 
       # If we're not in a class we care about, don't print stuff
@@ -163,7 +188,7 @@ task :update do
       end
 
       # Modify requires to overridden files to bring in the local version
-      if line =~ /\A(\s*require\s*['"])(.+)(['"]\s*)$/
+      if line =~ /\A(\s*require\s*['"])([^'"]+)(['"].*)/
         if CHEF_FILES.include?($2)
           line = "#{$1}chef_compat/copied_from_chef/#{$2}#{$3}"
         else
